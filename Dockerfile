@@ -95,6 +95,7 @@ CMD ["/start.sh"]
 FROM base AS downloader
 
 ARG HUGGINGFACE_ACCESS_TOKEN
+ENV HUGGINGFACE_ACCESS_TOKEN=${HUGGINGFACE_ACCESS_TOKEN}
 # Set default model type if none is provided
 ARG MODEL_TYPE=flux1-schnell
 
