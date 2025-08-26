@@ -96,7 +96,7 @@ FROM base AS downloader
 
 ARG HUGGINGFACE_ACCESS_TOKEN
 # Set default model type if none is provided
-ARG MODEL_TYPE=flux-krea
+ARG MODEL_TYPE=flux-krea-dev
 
 # Change working directory to ComfyUI
 WORKDIR /comfyui
@@ -105,7 +105,7 @@ WORKDIR /comfyui
 RUN mkdir -p models/checkpoints models/vae models/unet models/clip
 
 # Download checkpoints/vae/unet/clip models to include in image based on model type
-RUN if [ "$MODEL_TYPE" = "flux-krea" ]; then \
+RUN if [ "$MODEL_TYPE" = "flux-krea-dev" ]; then \
       wget -q -O models/unet/flux1-schnell-fp8.safetensors https://huggingface.co/Comfy-Org/FLUX.1-Krea-dev_ComfyUI/resolve/main/split_files/diffusion_models/flux1-krea-dev_fp8_scaled.safetensors &&; \
     fi
 
