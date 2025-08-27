@@ -1,0 +1,260 @@
+name: Docker Image CI
+
+on:
+  push:
+    branches: 
+      - main
+      - develop
+    tags:
+      - 'v*'
+  pull_request:
+    branches: 
+      - main
+      - develop
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Target to build (base, sdxl, sd3, flux1-schnell, flux1-dev, flux1-dev-fp8, base-cuda12-8-1, all)'
+        required: false
+        default: 'base'
+        type: choice
+        options:
+          - base
+          - sdxl
+          - sd3
+          - flux1-schnell
+          - flux1-dev
+          - flux1-dev-fp8
+          - base-cuda12-8-1
+          - all
+      push_to_registry:
+        description: 'Push to Docker Hub registry'
+        required: false
+        default: false
+        type: boolean
+      tag_suffix:
+        description: 'Tag suffix (e.g., "-dev", "-test")'
+        required: false
+        default: ''
+        type: string
+
+env:
+  DOCKERHUB_REPO: ${{ vars.DOCKERHUB_REPO || 'runpod' }}
+  DOCKERHUB_IMG: ${{ vars.DOCKERHUB_IMG || 'worker-comfyui' }}
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.targets.outputs.targets }}
+      version: ${{ steps.version.outputs.version }}
+      should_push: ${{ steps.push.outputs.should_push }}
+      registry_tags: ${{ steps.tags.outputs.registry_tags }}
+      dockerhub_tags: ${{ steps.tags.outputs.dockerhub_tags }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine targets to build
+        id: targets
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ github.event.inputs.target }}" = "all" ]; then
+              echo "targets=[\"base\", \"sdxl\", \"sd3\", \"flux1-schnell\", \"flux1-dev\", \"flux1-dev-fp8\", \"base-cuda12-8-1\"]" >> $GITHUB_OUTPUT
+            else
+              echo "targets=[\"${{ github.event.inputs.target }}\"]" >> $GITHUB_OUTPUT
+            fi
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            # Only build base image for PRs to save time and resources
+            echo "targets=[\"base\"]" >> $GITHUB_OUTPUT
+          else
+            # Build all targets for main branch pushes and tags
+            echo "targets=[\"base\", \"sdxl\", \"sd3\", \"flux1-schnell\", \"flux1-dev\", \"flux1-dev-fp8\", \"base-cuda12-8-1\"]" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag_suffix }}" ]; then
+            VERSION="latest${{ github.event.inputs.tag_suffix }}"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            VERSION="latest"
+          elif [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+            VERSION="dev"
+          else
+            VERSION="pr-${{ github.event.number }}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Determine if should push
+        id: push
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_push=${{ github.event.inputs.push_to_registry }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "should_push=false" >> $GITHUB_OUTPUT
+          elif [[ $GITHUB_REF == refs/tags/v* ]] || [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "should_push=true" >> $GITHUB_OUTPUT
+          else
+            echo "should_push=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate tags
+        id: tags
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          
+          # GitHub Container Registry tags
+          GHCR_BASE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          REGISTRY_TAGS=""
+          
+          # Docker Hub tags
+          DOCKERHUB_BASE="${{ env.DOCKERHUB_REPO }}/${{ env.DOCKERHUB_IMG }}"
+          DOCKERHUB_TAGS=""
+          
+          echo "registry_tags=$GHCR_BASE" >> $GITHUB_OUTPUT
+          echo "dockerhub_tags=$DOCKERHUB_BASE" >> $GITHUB_OUTPUT
+
+  build:
+    needs: prepare
+    runs-on: [blacksmith-8vcpu-ubuntu-2204, linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.prepare.outputs.targets) }}
+    
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clear space to remove unused folders
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo docker system prune -af
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: needs.prepare.outputs.should_push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: needs.prepare.outputs.should_push == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Blacksmith Docker layer cache
+        uses: useblacksmith/build-push-action@v1
+        with:
+          setup-only: true
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            ${{ env.DOCKERHUB_REPO }}/${{ env.DOCKERHUB_IMG }}
+          tags: |
+            type=ref,event=branch,suffix=-${{ matrix.target }}
+            type=ref,event=pr,suffix=-${{ matrix.target }}
+            type=raw,value=${{ needs.prepare.outputs.version }}-${{ matrix.target }}
+            type=raw,value=latest-${{ matrix.target }},enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/bake-action@v4
+        with:
+          targets: ${{ matrix.target }}
+          push: ${{ needs.prepare.outputs.should_push }}
+          set: |
+            *.args.DOCKERHUB_REPO=${{ env.DOCKERHUB_REPO }}
+            *.args.DOCKERHUB_IMG=${{ env.DOCKERHUB_IMG }}
+            *.args.RELEASE_VERSION=${{ needs.prepare.outputs.version }}
+            *.args.HUGGINGFACE_ACCESS_TOKEN=${{ secrets.HUGGINGFACE_ACCESS_TOKEN }}
+            ${{ matrix.target }}.tags=${{ steps.meta.outputs.tags }}
+
+      - name: Generate artifact attestation
+        if: needs.prepare.outputs.should_push == 'true'
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  update-description:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    if: needs.prepare.outputs.should_push == 'true' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update Docker Hub description
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ env.DOCKERHUB_REPO }}/${{ env.DOCKERHUB_IMG }}
+          short-description: "RunPod Worker for ComfyUI - AI image generation"
+          readme-filepath: ./README.md
+
+  security-scan:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    if: needs.prepare.outputs.should_push == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJson(needs.prepare.outputs.targets) }}
+    
+    steps:
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.prepare.outputs.version }}-${{ matrix.target }}
+          format: 'sarif'
+          output: 'trivy-results-${{ matrix.target }}.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results-${{ matrix.target }}.sarif'
+          category: 'trivy-${{ matrix.target }}'
+
+  notify:
+    needs: [prepare, build, update-description]
+    runs-on: ubuntu-latest
+    if: always() && (needs.build.result == 'failure' || needs.build.result == 'success')
+    steps:
+      - name: Notify build status
+        run: |
+          if [ "${{ needs.build.result }}" = "success" ]; then
+            echo "✅ Docker images built successfully for targets: ${{ needs.prepare.outputs.targets }}"
+            echo "📦 Version: ${{ needs.prepare.outputs.version }}"
+            echo "🚀 Pushed to registry: ${{ needs.prepare.outputs.should_push }}"
+          else
+            echo "❌ Docker image build failed"
+            exit 1
+          fi
